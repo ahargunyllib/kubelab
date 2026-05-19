@@ -1,0 +1,176 @@
+---
+- name: Common Kubernetes setup for all nodes
+  hosts: kubernetes
+  become: true
+  gather_facts: true
+  vars_files:
+    - ../vars/infra.yml
+
+  tasks:
+    - name: Disable swap immediately
+      ansible.builtin.command: swapoff -a
+      when: ansible_swaptotal_mb > 0
+      changed_when: ansible_swaptotal_mb > 0
+
+    - name: Disable swap permanently in fstab
+      ansible.builtin.replace:
+        path: /etc/fstab
+        regexp: '^([^#].*\sswap\s+.*)$'
+        replace: '# \1'
+
+    - name: Install base packages
+      ansible.builtin.apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gpg
+          - gnupg
+          - jq
+          - software-properties-common
+        update_cache: true
+        state: present
+
+    - name: Configure Kubernetes kernel modules
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/k8s.conf
+        mode: "0644"
+        content: |
+          overlay
+          br_netfilter
+
+    - name: Load overlay module
+      ansible.builtin.command: modprobe overlay
+      changed_when: false
+
+    - name: Load br_netfilter module
+      ansible.builtin.command: modprobe br_netfilter
+      changed_when: false
+
+    - name: Configure Kubernetes sysctl settings
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/k8s.conf
+        mode: "0644"
+        content: |
+          net.bridge.bridge-nf-call-iptables = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.ipv4.ip_forward = 1
+      register: sysctl_config
+
+    - name: Apply sysctl settings
+      ansible.builtin.command: sysctl --system
+      when: sysctl_config.changed
+
+    - name: Ensure apt keyring directory exists
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+
+    - name: Download CRI-O repository key
+      ansible.builtin.get_url:
+        url: "https://download.opensuse.org/repositories/isv:/cri-o:/stable:/{{ crio_version }}/deb/Release.key"
+        dest: /tmp/cri-o-release.key
+        mode: "0644"
+
+    - name: Install CRI-O repository key
+      ansible.builtin.command: gpg --dearmor --yes -o /etc/apt/keyrings/cri-o-apt-keyring.gpg /tmp/cri-o-release.key
+      changed_when: false
+
+    - name: Add CRI-O repository
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/cri-o.list
+        mode: "0644"
+        content: |
+          deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://download.opensuse.org/repositories/isv:/cri-o:/stable:/{{ crio_version }}/deb/ /
+
+    - name: Download Kubernetes repository key
+      ansible.builtin.get_url:
+        url: "https://pkgs.k8s.io/core:/stable:/{{ kubernetes_version }}/deb/Release.key"
+        dest: /tmp/kubernetes-release.key
+        mode: "0644"
+
+    - name: Install Kubernetes repository key
+      ansible.builtin.command: gpg --dearmor --yes -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg /tmp/kubernetes-release.key
+      changed_when: false
+
+    - name: Add Kubernetes repository
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/kubernetes.list
+        mode: "0644"
+        content: |
+          deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/{{ kubernetes_version }}/deb/ /
+
+    - name: Install CRI-O and Kubernetes packages
+      ansible.builtin.apt:
+        name:
+          - cri-o
+          - "kubelet={{ kubernetes_install_version }}"
+          - "kubeadm={{ kubernetes_install_version }}"
+          - "kubectl={{ kubernetes_install_version }}"
+        update_cache: true
+        state: present
+        allow_downgrade: true
+
+    - name: Enable and start CRI-O
+      ansible.builtin.systemd:
+        name: crio
+        daemon_reload: true
+        enabled: true
+        state: restarted
+
+    - name: Check installed crictl version
+      ansible.builtin.command: crictl --version
+      register: crictl_current
+      failed_when: false
+      changed_when: false
+
+    - name: Select crictl architecture
+      ansible.builtin.set_fact:
+        crictl_arch: "{{ 'arm64' if ansible_architecture in ['aarch64', 'arm64'] else 'amd64' }}"
+
+    - name: Download crictl archive
+      ansible.builtin.get_url:
+        url: "https://github.com/kubernetes-sigs/cri-tools/releases/download/{{ crictl_version }}/crictl-{{ crictl_version }}-linux-{{ crictl_arch }}.tar.gz"
+        dest: "/tmp/crictl-{{ crictl_version }}-linux-{{ crictl_arch }}.tar.gz"
+        mode: "0644"
+      when: crictl_version not in crictl_current.stdout
+
+    - name: Install crictl
+      ansible.builtin.unarchive:
+        src: "/tmp/crictl-{{ crictl_version }}-linux-{{ crictl_arch }}.tar.gz"
+        dest: /usr/local/bin
+        remote_src: true
+        mode: "0755"
+      when: crictl_version not in crictl_current.stdout
+
+    - name: Configure crictl for CRI-O
+      ansible.builtin.copy:
+        dest: /etc/crictl.yaml
+        mode: "0644"
+        content: |
+          runtime-endpoint: unix:///run/crio/crio.sock
+          image-endpoint: unix:///run/crio/crio.sock
+          timeout: 10
+          debug: false
+
+    - name: Configure kubelet node IP
+      ansible.builtin.copy:
+        dest: /etc/default/kubelet
+        mode: "0644"
+        content: |
+          KUBELET_EXTRA_ARGS=--node-ip={{ ansible_default_ipv4.address }}
+
+    - name: Hold Kubernetes packages
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+
+    - name: Enable kubelet
+      ansible.builtin.systemd:
+        name: kubelet
+        enabled: true

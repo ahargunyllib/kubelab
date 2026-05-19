@@ -1,0 +1,15 @@
+[masters]
+master ansible_host=${master_public_ip} ansible_user=${ssh_user}
+
+[workers]
+%{ for worker in workers ~}
+${worker.name} ansible_host=${worker.public_ip} ansible_user=${ssh_user}
+%{ endfor ~}
+
+[kubernetes:children]
+masters
+workers
+
+[all:vars]
+ansible_ssh_private_key_file=${private_key_path}
+ansible_ssh_common_args='-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'

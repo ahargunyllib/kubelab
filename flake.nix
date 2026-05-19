@@ -18,6 +18,8 @@
         pkgs.terraform
         pkgs.ansible
         pkgs.awscli2
+        pkgs.jq
+        pkgs.kubectl
       ];
     };
   };

@@ -1,0 +1,6 @@
+---
+- import_playbook: playbooks/00-common-setup.yml
+- import_playbook: playbooks/01-control-plane.yml
+- import_playbook: playbooks/02-worker-join.yml
+- import_playbook: playbooks/03-sample-app.yml
+- import_playbook: playbooks/04-show-evidence.yml

@@ -1,0 +1,16 @@
+# Copy this file to terraform.tfvars, then adjust the values.
+
+project_name = "kubelab"
+aws_region   = "us-east-1"
+
+# Use an existing AWS EC2 key pair.
+key_name = "kubelab"
+
+# Use the matching local private key.
+private_key_path = "~/.ssh/kubelab.pem"
+
+# For a safer lab, replace this with your public IP in CIDR form:
+# allowed_cidr = "203.0.113.10/32"
+allowed_cidr = "0.0.0.0/0"
+
+worker_count = 1

@@ -1,0 +1,107 @@
+---
+- name: Initialize Kubernetes control plane
+  hosts: masters
+  become: true
+  gather_facts: true
+  vars_files:
+    - ../vars/infra.yml
+
+  tasks:
+    - name: Check whether control plane is already initialized
+      ansible.builtin.stat:
+        path: /etc/kubernetes/admin.conf
+      register: admin_conf
+
+    - name: Pull Kubernetes control-plane images
+      ansible.builtin.command: kubeadm config images pull --cri-socket=unix:///run/crio/crio.sock
+      when: not admin_conf.stat.exists
+
+    - name: Initialize Kubernetes control plane
+      ansible.builtin.command: >
+        kubeadm init
+        --apiserver-advertise-address={{ master_private_ip }}
+        --apiserver-cert-extra-sans={{ master_private_ip }},{{ master_public_ip }}
+        --pod-network-cidr={{ pod_network_cidr }}
+        --node-name {{ inventory_hostname }}
+        --cri-socket=unix:///run/crio/crio.sock
+        --ignore-preflight-errors=Swap
+      when: not admin_conf.stat.exists
+
+    - name: Create kubeconfig directory for SSH user
+      ansible.builtin.file:
+        path: /home/{{ ssh_user }}/.kube
+        state: directory
+        owner: "{{ ssh_user }}"
+        group: "{{ ssh_user }}"
+        mode: "0755"
+
+    - name: Copy admin kubeconfig for SSH user
+      ansible.builtin.copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/{{ ssh_user }}/.kube/config
+        remote_src: true
+        owner: "{{ ssh_user }}"
+        group: "{{ ssh_user }}"
+        mode: "0600"
+
+    - name: Install Calico CRDs
+      ansible.builtin.command: kubectl --kubeconfig=/home/{{ ssh_user }}/.kube/config apply --server-side --force-conflicts -f https://raw.githubusercontent.com/projectcalico/calico/{{ calico_version }}/manifests/v1_crd_projectcalico_org.yaml
+      register: calico_crds
+      changed_when: "'created' in calico_crds.stdout or 'configured' in calico_crds.stdout or 'serverside-applied' in calico_crds.stdout"
+
+    - name: Install Tigera operator
+      ansible.builtin.command: kubectl --kubeconfig=/home/{{ ssh_user }}/.kube/config apply -f https://raw.githubusercontent.com/projectcalico/calico/{{ calico_version }}/manifests/tigera-operator.yaml
+      register: tigera_operator
+      changed_when: "'created' in tigera_operator.stdout or 'configured' in tigera_operator.stdout"
+
+    - name: Download Calico custom resources
+      ansible.builtin.get_url:
+        url: "https://raw.githubusercontent.com/projectcalico/calico/{{ calico_version }}/manifests/custom-resources.yaml"
+        dest: /tmp/calico-custom-resources.yaml
+        mode: "0644"
+
+    - name: Configure Calico pod CIDR
+      ansible.builtin.replace:
+        path: /tmp/calico-custom-resources.yaml
+        regexp: 'cidr: 192\.168\.0\.0/16'
+        replace: "cidr: {{ pod_network_cidr }}"
+
+    - name: Apply Calico custom resources
+      ansible.builtin.command: kubectl --kubeconfig=/home/{{ ssh_user }}/.kube/config apply -f /tmp/calico-custom-resources.yaml
+      register: calico_custom_resources
+      changed_when: "'created' in calico_custom_resources.stdout or 'configured' in calico_custom_resources.stdout"
+
+    - name: Wait for Calico node pods
+      ansible.builtin.shell: |
+        set -e
+        until kubectl --kubeconfig=/home/{{ ssh_user }}/.kube/config get pods -n calico-system -l k8s-app=calico-node --no-headers 2>/dev/null | grep -q .; do
+          echo "Waiting for Calico node pods to be created..."
+          sleep 10
+        done
+        kubectl --kubeconfig=/home/{{ ssh_user }}/.kube/config wait --for=condition=ready pod -l k8s-app=calico-node -n calico-system --timeout=300s
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Wait for control-plane node to become Ready
+      ansible.builtin.command: kubectl --kubeconfig=/home/{{ ssh_user }}/.kube/config wait --for=condition=Ready node/{{ inventory_hostname }} --timeout=300s
+      changed_when: false
+
+    - name: Create worker join command
+      ansible.builtin.command: kubeadm token create --print-join-command
+      register: join_command
+      changed_when: false
+
+    - name: Store worker join command for later plays
+      ansible.builtin.set_fact:
+        kubeadm_join_command: "{{ join_command.stdout }} --cri-socket=unix:///run/crio/crio.sock"
+
+    - name: Store worker join script on control plane
+      ansible.builtin.copy:
+        dest: /home/{{ ssh_user }}/kubeadm-join-command.sh
+        owner: "{{ ssh_user }}"
+        group: "{{ ssh_user }}"
+        mode: "0700"
+        content: |
+          #!/usr/bin/env bash
+          {{ kubeadm_join_command }}

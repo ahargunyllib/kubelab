@@ -1,0 +1,50 @@
+---
+- name: Join worker nodes
+  hosts: workers
+  become: true
+  gather_facts: false
+  vars_files:
+    - ../vars/infra.yml
+
+  tasks:
+    - name: Check whether worker already joined
+      ansible.builtin.stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: kubelet_conf
+
+    - name: Join worker to the cluster
+      ansible.builtin.command: "{{ hostvars[groups['masters'][0]].kubeadm_join_command }}"
+      when: not kubelet_conf.stat.exists
+
+    - name: Ensure kubelet is running
+      ansible.builtin.systemd:
+        name: kubelet
+        enabled: true
+        state: started
+
+- name: Wait for all Kubernetes nodes to become Ready
+  hosts: masters
+  become: false
+  gather_facts: false
+  vars_files:
+    - ../vars/infra.yml
+
+  tasks:
+    - name: Wait for expected Ready node count
+      ansible.builtin.shell: |
+        set -e
+        expected="{{ 1 + (worker_public_ips | length) }}"
+        for attempt in $(seq 1 30); do
+          ready_count="$(kubectl get nodes --no-headers | awk '$2 == "Ready" { count++ } END { print count + 0 }')"
+          if [ "$ready_count" -eq "$expected" ]; then
+            kubectl get nodes -o wide
+            exit 0
+          fi
+          echo "Waiting for Ready nodes: $ready_count/$expected"
+          sleep 10
+        done
+        kubectl get nodes -o wide
+        exit 1
+      args:
+        executable: /bin/bash
+      changed_when: false
